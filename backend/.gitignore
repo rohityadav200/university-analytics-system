@@ -1,0 +1,6 @@
+# This prevents your password and installed packages from being committed to Git.
+node_modules/
+.env
+.env.*
+!.env.example
+npm-debug.log*
