@@ -8,7 +8,7 @@ import {
 import axios from "axios";
 import "./App.css";
 
-const API = "http://localhost:5000/api";
+const API = `${(import.meta.env.VITE_API_URL || "http://localhost:5000").replace(/\/$/, "")}/api`;
 axios.interceptors.request.use((config) => {
   const token = localStorage.getItem("unisuccesstoken");
   if (token) config.headers.Authorization = `Bearer ${token}`;
@@ -62,6 +62,8 @@ function App() {
   const [studentPortal, setStudentPortal] = useState(null);
   const [accounts, setAccounts] = useState([]);
   const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const [editingStudent, setEditingStudent] = useState(null);
+  const [editingAcademic, setEditingAcademic] = useState(null);
 
   async function loadData() {
     if (!authUser) return;
@@ -116,7 +118,7 @@ function App() {
         setError("Some data could not be loaded. Check the backend terminal.");
       }
     } catch {
-      setError("Cannot connect to the backend at localhost:5000.");
+      setError("Cannot connect to the backend. Please try again shortly.");
     } finally {
       setLoading(false);
     }
@@ -136,7 +138,7 @@ function App() {
         }
       } catch (err) {
         if (err.response?.status === 401) localStorage.removeItem("unisuccesstoken");
-        else if (alive) setError("Cannot connect to the backend at localhost:5000.");
+        else if (alive) setError("Cannot connect to the backend. Please try again shortly.");
       } finally { if (alive) setAuthChecking(false); }
     }
     initializeAuth();
@@ -202,6 +204,37 @@ function App() {
     } catch (err) {
       setError(err.response?.data?.message || "Could not update complaint status.");
     }
+  }
+
+  async function saveStudentEdit(event) {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      setError("");
+      await axios.put(`${API}/students/${editingStudent.student_id}`, {
+        ...values,
+        institution_id: Number(editingStudent.institution_id),
+        department_id: Number(editingStudent.department_id),
+        course_id: Number(editingStudent.course_id),
+      });
+      setNotice("Student details updated successfully.");
+      setEditingStudent(null);
+      await loadData();
+    } catch (err) { setError(err.response?.data?.message || "Could not update student details."); }
+  }
+
+  async function saveAcademicEdit(event) {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+    try {
+      setError("");
+      await axios.put(`${API}/academic-performance/${editingAcademic.performance_id}`, {
+        marks_obtained: Number(values.marks_obtained), exam_type: values.exam_type, exam_date: values.exam_date,
+      });
+      setNotice("Marks updated successfully.");
+      setEditingAcademic(null);
+      await loadData();
+    } catch (err) { setError(err.response?.data?.message || "Could not update marks."); }
   }
 
   async function updateStudentStatus(id, status) {
@@ -316,7 +349,7 @@ function App() {
 
         <div className="sidebar-bottom">
           <div className="connection-dot" />
-          <div><strong>API connection</strong><span>localhost:5000</span></div>
+          <div><strong>API connection</strong><span>{import.meta.env.VITE_API_URL || "http://localhost:5000"}</span></div>
         </div>
       </aside>
 
@@ -377,7 +410,7 @@ function App() {
 
               <div className="panel recent-panel">
                 <div className="panel-heading"><div><h3>Recent students</h3><p>Latest records from the student database</p></div><button className="text-button" onClick={() => navigate("students")}>View all →</button></div>
-                <StudentTable students={students.slice(0, 5)} onStatusChange={updateStudentStatus} canChange={authUser.role === "admin"} />
+                <StudentTable students={students.slice(0, 5)} onStatusChange={updateStudentStatus} onEdit={setEditingStudent} canChange={authUser.role === "admin"} />
               </div>
             </>
           )}
@@ -397,7 +430,20 @@ function App() {
                 </div>
                 <FormButtons onCancel={() => setShowForm(false)} />
               </form>}
-              <StudentTable students={filteredStudents} onStatusChange={updateStudentStatus} canChange={authUser.role === "admin"} />
+              {editingStudent && authUser.role === "admin" && <form className="record-form" onSubmit={saveStudentEdit}>
+                <h3>Edit student details — {editingStudent.registration_number}</h3>
+                <div className="form-grid">
+                  <Field label="Registration number" name="registration_number" required defaultValue={editingStudent.registration_number} />
+                  <Field label="First name" name="first_name" required defaultValue={editingStudent.first_name} />
+                  <Field label="Last name" name="last_name" required defaultValue={editingStudent.last_name} />
+                  <Field label="Email" name="email" type="email" required defaultValue={editingStudent.email} />
+                  <Field label="Admission date" name="admission_date" type="date" required defaultValue={String(editingStudent.admission_date ?? "").slice(0,10)} />
+                  <SelectField label="Department" name="department_id" required defaultValue={String(editingStudent.department_id)} options={departments.map(d=>({value:String(d.department_id),label:d.name}))} />
+                  <SelectField label="Course" name="course_id" required defaultValue={String(editingStudent.course_id)} options={courses.map(c=>({value:String(c.course_id),label:c.name}))} />
+                  <SelectField label="Status" name="status" required defaultValue={editingStudent.status} options={["active","graduated","suspended","withdrawn"].map(v=>({value:v,label:v}))} />
+                </div><div className="form-actions"><button type="submit" className="primary-button">Save changes</button><button type="button" className="secondary-button" onClick={()=>setEditingStudent(null)}>Cancel</button></div>
+              </form>}
+              <StudentTable students={filteredStudents} onStatusChange={updateStudentStatus} canChange={authUser.role === "admin"} onEdit={setEditingStudent} />
             </ModulePanel>
           )}
 
@@ -429,9 +475,10 @@ function App() {
                 <Field label="Marks obtained" name="marks_obtained" type="number" required />
                 <Field label="Exam date" name="exam_date" type="date" required />
               </div><FormButtons onCancel={() => setShowForm(false)} /></form>}
-              <div className="table-wrap"><table><thead><tr><th>Student</th><th>Registration no.</th><th>Subject</th><th>Exam type</th><th>Marks</th><th>Exam date</th></tr></thead><tbody>
-                {academic.filter(a => `${a.first_name ?? ""} ${a.last_name ?? ""} ${a.registration_number ?? ""} ${a.student_id} ${a.subject_name ?? ""} ${a.exam_type}`.toLowerCase().includes(search.toLowerCase())).map(a=><tr key={a.performance_id}><td><strong>{`${a.first_name ?? ""} ${a.last_name ?? ""}`.trim() || `Student ${a.student_id}`}</strong><small>ID: {a.student_id}</small></td><td>{a.registration_number ?? "—"}</td><td>{a.subject_name ?? `Subject ${a.subject_id}`}</td><td>{a.exam_type}</td><td><strong>{a.marks_obtained}</strong></td><td>{String(a.exam_date ?? "").slice(0,10)}</td></tr>)}
-                {academic.length===0 && <EmptyRow columns={6} text="No academic records yet." />}
+              {editingAcademic && authUser.role === "admin" && <form className="record-form" onSubmit={saveAcademicEdit}><h3>Correct marks — {editingAcademic.subject_name}</h3><div className="form-grid"><Field label="Marks obtained (max " name="marks_obtained" type="number" required min="0" max={editingAcademic.max_marks ?? 100} defaultValue={editingAcademic.marks_obtained} /><SelectField label="Exam type" name="exam_type" required options={["internal","midterm","endterm","practical"].map(v=>({value:v,label:v}))}/><Field label="Exam date" name="exam_date" type="date" required defaultValue={String(editingAcademic.exam_date??"").slice(0,10)} /></div><div className="form-actions"><button type="submit" className="primary-button">Save correction</button><button type="button" className="secondary-button" onClick={()=>setEditingAcademic(null)}>Cancel</button></div></form>}
+              <div className="table-wrap"><table><thead><tr><th>Student</th><th>Registration no.</th><th>Subject</th><th>Exam type</th><th>Marks</th><th>Exam date</th>{authUser.role === "admin" && <th>Action</th>}</tr></thead><tbody>
+                {academic.filter(a => `${a.first_name ?? ""} ${a.last_name ?? ""} ${a.registration_number ?? ""} ${a.student_id} ${a.subject_name ?? ""} ${a.exam_type}`.toLowerCase().includes(search.toLowerCase())).map(a=><tr key={a.performance_id}><td><strong>{`${a.first_name ?? ""} ${a.last_name ?? ""}`.trim() || `Student ${a.student_id}`}</strong><small>ID: {a.student_id}</small></td><td>{a.registration_number ?? "—"}</td><td>{a.subject_name ?? `Subject ${a.subject_id}`}</td><td>{a.exam_type}</td><td><strong>{a.marks_obtained}</strong> / {a.max_marks ?? 100}</td><td>{String(a.exam_date ?? "").slice(0,10)}</td>{authUser.role === "admin" && <td><button type="button" className="text-button" onClick={()=>setEditingAcademic(a)}>Edit marks</button></td>}</tr>)}
+                {academic.length===0 && <EmptyRow columns={authUser.role === "admin" ? 7 : 6} text="No academic records yet." />}
               </tbody></table></div>
               <p className="helper-note">Type any subject name. If it already exists for the student's course, it will be reused; otherwise, the system creates it automatically with a default maximum of 100 and pass mark of 40. No need to add the subject separately.</p>
             </ModulePanel>
@@ -528,19 +575,19 @@ function ModulePanel({ title, description, children, showForm, setShowForm, onRe
   </div>;
 }
 
-function StudentTable({ students, onStatusChange, canChange = true }) {
-  return <div className="table-wrap"><table><thead><tr><th>Student</th><th>Registration no.</th><th>Department</th><th>Course</th><th>Status</th><th>Change status</th></tr></thead><tbody>
-    {students.map(s=><tr key={s.student_id}><td><div className="student-cell"><div className="avatar">{`${s.first_name?.[0]??""}${s.last_name?.[0]??""}`}</div><div><strong>{s.first_name} {s.last_name}</strong><small>{s.email}</small></div></div></td><td>{s.registration_number}</td><td>{s.department_name??"—"}</td><td>{s.course_name??"—"}</td><td><StatusPill value={s.status}/></td><td>{canChange ? <select value={s.status} onChange={e=>onStatusChange(s.student_id,e.target.value)}><option value="active">Active</option><option value="graduated">Graduated</option><option value="suspended">Suspended</option><option value="withdrawn">Withdrawn</option></select> : <span className="muted-note">View only</span>}</td></tr>)}
-    {students.length===0 && <EmptyRow columns={6} text="No student records found."/>}
+function StudentTable({ students, onStatusChange, onEdit, canChange = true }) {
+  return <div className="table-wrap"><table><thead><tr><th>Student</th><th>Registration no.</th><th>Department</th><th>Course</th><th>Status</th><th>Change status</th>{canChange && <th>Edit details</th>}</tr></thead><tbody>
+    {students.map(s=><tr key={s.student_id}><td><div className="student-cell"><div className="avatar">{`${s.first_name?.[0]??""}${s.last_name?.[0]??""}`}</div><div><strong>{s.first_name} {s.last_name}</strong><small>{s.email}</small></div></div></td><td>{s.registration_number}</td><td>{s.department_name??"—"}</td><td>{s.course_name??"—"}</td><td><StatusPill value={s.status}/></td><td>{canChange ? <select value={s.status} onChange={e=>onStatusChange(s.student_id,e.target.value)}><option value="active">Active</option><option value="graduated">Graduated</option><option value="suspended">Suspended</option><option value="withdrawn">Withdrawn</option></select> : <span className="muted-note">View only</span>}</td>{canChange && <td><button type="button" className="text-button" onClick={()=>onEdit?.(s)}>Edit</button></td>}</tr>)}
+    {students.length===0 && <EmptyRow columns={canChange ? 7 : 6} text="No student records found."/>}
   </tbody></table></div>;
 }
 
-function Field({ label, name, type="text", required=false, placeholder, maxLength, min, max, step }) {
-  return <div className="field"><label htmlFor={name}>{label}{required?" *":""}</label><input id={name} name={name} type={type} required={required} placeholder={placeholder} maxLength={maxLength} min={min} max={max} step={step} /></div>;
+function Field({ label, name, type="text", required=false, placeholder, maxLength, min, max, step, defaultValue }) {
+  return <div className="field"><label htmlFor={name}>{label}{required?" *":""}</label><input id={name} name={name} type={type} required={required} placeholder={placeholder} maxLength={maxLength} min={min} max={max} step={step} defaultValue={defaultValue} /></div>;
 }
 
-function SelectField({ label, name, options, required=false }) {
-  return <div className="field"><label htmlFor={name}>{label}{required?" *":""}</label><select id={name} name={name} required={required} defaultValue=""><option value="" disabled>Select {label.toLowerCase()}</option>{options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select></div>;
+function SelectField({ label, name, options, required=false, defaultValue="" }) {
+  return <div className="field"><label htmlFor={name}>{label}{required?" *":""}</label><select id={name} name={name} required={required} defaultValue={defaultValue}><option value="" disabled>Select {label.toLowerCase()}</option>{options.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}</select></div>;
 }
 
 function FormButtons({ onCancel }) {
@@ -565,38 +612,84 @@ function AuthScreen({ setupRequired, onAuthenticated }) {
   const [role, setRole] = useState("student");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [registrationNumber, setRegistrationNumber] = useState("");
+  const [email, setEmail] = useState("");
+  const [otp, setOtp] = useState("");
+  const [verificationToken, setVerificationToken] = useState("");
+  const [recoveredDetails, setRecoveredDetails] = useState(null);
+  const [recoveryStep, setRecoveryStep] = useState("email");
+  const [registrationStep, setRegistrationStep] = useState("details");
+
+  function switchMode(nextMode) {
+    setMode(nextMode); setMessage(""); setOtp(""); setVerificationToken("");
+    setRecoveredDetails(null); setRecoveryStep("email"); setRegistrationStep("details");
+  }
   async function submit(event) {
     event.preventDefault();
     const values = Object.fromEntries(new FormData(event.currentTarget).entries());
     setBusy(true); setMessage("");
     try {
       if (mode === "register") {
-        await axios.post(`${API}/auth/student-register`, values);
-        setMode("login");
-        setRole("student");
-        setMessage("Student account created. You can now sign in.");
+        const reg = registrationNumber.trim(); const mail = email.trim().toLowerCase();
+        if (registrationStep === "details") {
+          await axios.post(`${API}/auth/student-register/request-otp`, { registration_number: reg, email: mail });
+          setRegistrationStep("otp"); setMessage("If the details match your university record, an OTP has been sent to your registered email.");
+        } else if (registrationStep === "otp") {
+          const response = await axios.post(`${API}/auth/student-register/verify-otp`, { registration_number: reg, email: mail, otp });
+          setVerificationToken(response.data.verification_token); setRegistrationStep("password"); setMessage("Email verified. Create a password for your account.");
+        } else {
+          if (values.password !== values.confirm_password) { setMessage("Passwords do not match."); setBusy(false); return; }
+          await axios.post(`${API}/auth/student-register`, { registration_number: reg, email: mail, password: values.password, verification_token: verificationToken });
+          switchMode("login"); setRole("student"); setMessage("Student account created successfully. Please sign in.");
+        }
+      } else if (mode === "recover") {
+        const mail = email.trim().toLowerCase();
+        if (recoveryStep === "email") {
+          await axios.post(`${API}/auth/recover-registration/request-otp`, { email: mail });
+          setRecoveryStep("otp"); setMessage("If this email matches one student record, a verification code has been sent.");
+        } else {
+          const response = await axios.post(`${API}/auth/recover-registration/verify-otp`, { email: mail, otp });
+          setRecoveredDetails(response.data.data); setMessage("Email verified. Your registration details are shown below.");
+        }
       } else {
         if (mode === "login") values.role = role;
         const response = await axios.post(`${API}/auth/${mode === "setup" ? "setup" : "login"}`, values);
         onAuthenticated(response.data.data.user, response.data.data.token);
       }
-    } catch (err) { setMessage(err.response?.data?.message || "Could not connect to the server. Make sure the backend is running."); }
+    } catch (err) { setMessage(err.response?.data?.message || "Could not connect to the server. Please try again shortly."); }
     finally { setBusy(false); }
   }
   const isRegister = mode === "register";
+  const isRecovery = mode === "recover";
+  const inputStyle = { ...authInput };
   return <div style={centerScreen}><form onSubmit={submit} style={authCard}>
     <div style={{ display:"flex", alignItems:"center", gap:12, color:"#3157c8" }}><GraduationCap size={36}/><div><h1 style={{ margin:0, fontSize:25, color:"#172033" }}>University Analytics</h1><span style={{ color:"#64748b", fontSize:13 }}>University Analytics System</span></div></div>
-    <h2 style={{ marginTop:28, marginBottom:6 }}>{mode === "setup" ? "Create the first Admin" : isRegister ? "Create student account" : "Sign in to your portal"}</h2>
-    <p style={{ color:"#64748b", lineHeight:1.5, marginTop:0 }}>{mode === "setup" ? "One-time setup. The first account becomes the university administrator." : isRegister ? "Use the registration number and email already recorded by your university." : "Choose your role and sign in with your account."}</p>
+    <h2 style={{ marginTop:28, marginBottom:6 }}>{mode === "setup" ? "Create the first Admin" : isRegister ? "Create student account" : isRecovery ? "Find registration details" : "Sign in to your portal"}</h2>
+    <p style={{ color:"#64748b", lineHeight:1.5, marginTop:0 }}>{mode === "setup" ? "One-time setup. The first account becomes the university administrator." : isRegister ? "Verify the email already recorded in your university student record." : isRecovery ? "Verify your university-recorded email to recover your registration number." : "Choose your role and sign in with your account."}</p>
     {mode === "login" && !setupRequired && <div style={{ marginTop:18 }}><span style={{ display:"block", fontWeight:600, fontSize:14, marginBottom:8 }}>Login as</span><div style={{ display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:8 }}>{[{id:"student",label:"Student",Icon:UserRound},{id:"teacher",label:"Teacher",Icon:GraduationCap},{id:"admin",label:"Admin",Icon:ShieldCheck}].map(item=><button key={item.id} type="button" onClick={()=>setRole(item.id)} style={{ border:`1px solid ${role===item.id?"#3157c8":"#d7deea"}`, background:role===item.id?"#edf2ff":"white", color:role===item.id?"#2449b4":"#475569", borderRadius:9, padding:"11px 6px", fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:5 }}><item.Icon size={16}/>{item.label}</button>)}</div></div>}
-    {mode === "setup" && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Full name<input name="name" required maxLength="150" style={authInput} placeholder="Administrator name"/></label>}
-    {isRegister && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>University registration number<input name="registration_number" required maxLength="60" style={authInput} placeholder="e.g. DEMO-MCA-001"/></label>}
-    <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Email<input name="email" type="email" required style={authInput} placeholder="you@university.edu" autoComplete="username"/></label>
-    <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Password<input name="password" type="password" required minLength={mode === "setup" || isRegister ? 8 : undefined} style={authInput} placeholder={mode === "setup" || isRegister ? "At least 8 characters" : "Enter password"} autoComplete={mode === "setup" || isRegister ? "new-password" : "current-password"}/></label>
-    {message && <p role="alert" style={{ color:message.includes("created")?"#067647":"#b42318", background:message.includes("created")?"#ecfdf3":"#fff0ef", padding:10, borderRadius:8, fontSize:14 }}>{message}</p>}
-    <button type="submit" disabled={busy} style={{ width:"100%", marginTop:22, border:0, borderRadius:9, padding:13, background:"#3157c8", color:"white", fontWeight:700, fontSize:15, cursor:"pointer" }}>{busy ? "Please wait…" : mode === "setup" ? "Create Admin account" : isRegister ? "Create student account" : `Sign in as ${role[0].toUpperCase()+role.slice(1)}`}</button>
-    {!setupRequired && <p style={{ marginBottom:0, color:"#64748b", fontSize:13, lineHeight:1.5 }}>{isRegister ? "Teacher and Admin accounts must be created by the university administrator." : "Need access? Students can register using their existing university record. Teachers and Admins should contact the university administrator."}</p>}
-    {!setupRequired && <button type="button" onClick={()=>{setMode(isRegister?"login":"register");setMessage("");}} style={{ width:"100%", marginTop:12, border:"1px solid #d7deea", borderRadius:9, padding:12, background:"white", color:"#3157c8", fontWeight:700, cursor:"pointer" }}>{isRegister ? "Back to sign in" : "Create student account"}</button>}
+    {mode === "setup" && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Full name<input name="name" required maxLength="150" style={inputStyle} placeholder="Administrator name"/></label>}
+    {isRegister && <>
+      <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>University registration number<input value={registrationNumber} onChange={e=>setRegistrationNumber(e.target.value)} required maxLength={60} disabled={registrationStep !== "details"} style={inputStyle} placeholder="e.g. DEMO-MCA-001"/></label>
+      <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>University-recorded email<input value={email} onChange={e=>setEmail(e.target.value)} type="email" required disabled={registrationStep !== "details"} style={inputStyle} placeholder="Email saved in student record" autoComplete="email"/></label>
+      {registrationStep === "otp" && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>6-digit verification code<input value={otp} onChange={e=>setOtp(e.target.value.replace(/\D/g,"").slice(0,6))} required inputMode="numeric" pattern="[0-9]{6}" style={inputStyle} placeholder="Enter OTP from email"/></label>}
+      {registrationStep === "password" && <><label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Create password<input name="password" type="password" required minLength={8} maxLength={128} style={inputStyle} placeholder="At least 8 characters" autoComplete="new-password"/></label><label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Confirm password<input name="confirm_password" type="password" required minLength={8} maxLength={128} style={inputStyle} placeholder="Re-enter password" autoComplete="new-password" onChange={e=>{}}/></label></>}
+    </>}
+    {isRecovery && <>
+      <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>University-recorded email<input value={email} onChange={e=>setEmail(e.target.value)} type="email" required disabled={recoveryStep !== "email"} style={inputStyle} placeholder="Email saved in student record" autoComplete="email"/></label>
+      {recoveryStep === "otp" && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>6-digit verification code<input value={otp} onChange={e=>setOtp(e.target.value.replace(/\D/g,"").slice(0,6))} required inputMode="numeric" pattern="[0-9]{6}" style={inputStyle} placeholder="Enter OTP from email"/></label>}
+      {recoveredDetails && <div style={{ marginTop:14, padding:13, borderRadius:9, background:"#ecfdf3", color:"#067647", lineHeight:1.7 }}><strong>{recoveredDetails.name}</strong><br/>Registration number: <strong>{recoveredDetails.registration_number}</strong></div>}
+    </>}
+    {!isRegister && !isRecovery && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>{mode === "setup" ? "Email" : "Email"}<input name="email" type="email" required style={inputStyle} placeholder="you@university.edu" autoComplete="username"/></label>}
+    {!isRegister && !isRecovery && <label style={{ display:"block", marginTop:15, fontWeight:600, fontSize:14 }}>Password<input name="password" type="password" required minLength={mode === "setup" ? 8 : undefined} style={inputStyle} placeholder={mode === "setup" ? "At least 8 characters" : "Enter password"} autoComplete={mode === "setup" ? "new-password" : "current-password"}/></label>}
+    {message && <p role="status" style={{ color:(message.includes("successfully") || message.includes("verified") || message.includes("sent") || message.includes("created"))?"#067647":"#b42318", background:(message.includes("successfully") || message.includes("verified") || message.includes("sent") || message.includes("created"))?"#ecfdf3":"#fff0ef", padding:10, borderRadius:8, fontSize:14 }}>{message}</p>}
+    {!recoveredDetails && <button type="submit" disabled={busy} style={{ width:"100%", marginTop:22, border:0, borderRadius:9, padding:13, background:"#3157c8", color:"white", fontWeight:700, fontSize:15, cursor:"pointer" }}>{busy ? "Please wait…" : mode === "setup" ? "Create Admin account" : isRegister ? registrationStep === "details" ? "Send verification code" : registrationStep === "otp" ? "Verify email" : "Create student account" : isRecovery ? recoveryStep === "email" ? "Send verification code" : "Verify and find details" : `Sign in as ${role[0].toUpperCase()+role.slice(1)}`}</button>}
+    {!setupRequired && <div style={{ display:"grid", gap:8, marginTop:12 }}>
+      {mode === "login" && <><button type="button" onClick={()=>switchMode("register")} style={{ width:"100%", border:"1px solid #d7deea", borderRadius:9, padding:12, background:"white", color:"#3157c8", fontWeight:700, cursor:"pointer" }}>Create student account</button><button type="button" onClick={()=>switchMode("recover")} style={{ width:"100%", border:0, padding:8, background:"transparent", color:"#3157c8", fontWeight:600, cursor:"pointer" }}>Find my registration details</button></>}
+      {(isRegister || isRecovery) && <button type="button" onClick={()=>switchMode("login")} style={{ width:"100%", border:"1px solid #d7deea", borderRadius:9, padding:12, background:"white", color:"#3157c8", fontWeight:700, cursor:"pointer" }}>Back to sign in</button>}
+      {isRegister && registrationStep !== "details" && <button type="button" onClick={()=>{setRegistrationStep("details");setOtp("");setVerificationToken("");setMessage("");}} style={{ width:"100%", border:0, padding:8, background:"transparent", color:"#64748b", cursor:"pointer" }}>Use different student details</button>}
+      {isRecovery && recoveryStep !== "email" && !recoveredDetails && <button type="button" onClick={()=>{setRecoveryStep("email");setOtp("");setMessage("");}} style={{ width:"100%", border:0, padding:8, background:"transparent", color:"#64748b", cursor:"pointer" }}>Use a different email</button>}
+    </div>}
+    {mode === "login" && <p style={{ marginBottom:0, color:"#64748b", fontSize:13, lineHeight:1.5 }}>Teacher and Admin accounts are created by the university administrator. Existing administrator-created student accounts can sign in as usual.</p>}
   </form></div>;
 }
 
