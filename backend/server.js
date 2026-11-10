@@ -16,10 +16,23 @@ const app = express();
 const PORT = Number(process.env.PORT) || 5000;
 
 app.use(helmet());
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://university-analytics-system.vercel.app"
+];
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS: " + origin));
+      }
+    },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
   })
 );
 app.use(express.json({ limit: "1mb" }));
@@ -220,28 +233,113 @@ app.post("/api/auth/setup", asyncHandler(async (req, res) => {
   res.status(201).json({ success: true, data: { token, user } });
 }));
 
+// OTP-backed student registration and registration-number recovery.
+const OTP_PEPPER = process.env.JWT_SECRET || "local-development-secret-change-before-deployment";
+const otpHash = (otp, email, purpose) => crypto.createHmac("sha256", OTP_PEPPER).update(`${purpose}:${email}:${otp}`).digest("hex");
+const safeEqual = (a, b) => {
+  const aa = Buffer.from(String(a)); const bb = Buffer.from(String(b));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+};
+async function sendStudentOtp(email, otp, purpose) {
+  const transport = getMailTransport();
+  if (!transport) throw new Error("SMTP_NOT_CONFIGURED");
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const subject = purpose === "student-registration" ? "Verify your university student account" : "Recover your university registration details";
+  await transport.sendMail({
+    from, to: email, subject,
+    text: `Your University Analytics verification code is ${otp}. It expires in 10 minutes. If you did not request this, you can ignore this email.`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:auto"><h2>University Analytics</h2><p>Your verification code is:</p><p style="font-size:30px;font-weight:bold;letter-spacing:6px">${otp}</p><p>This code expires in 10 minutes. Do not share it with anyone.</p></div>`
+  });
+}
+async function createOtp(email, purpose, registrationNumber = null) {
+  const recent = await first(`SELECT COUNT(*) AS total FROM student_auth_otps WHERE email = ? AND purpose = ? AND created_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)`, [email, purpose]);
+  if (Number(recent?.total || 0) > 0) return false;
+  const otp = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+  await pool.execute(`UPDATE student_auth_otps SET used_at = NOW() WHERE email = ? AND purpose = ? AND used_at IS NULL`, [email, purpose]);
+  await pool.execute(`INSERT INTO student_auth_otps (email, registration_number, purpose, otp_hash, expires_at, attempts) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE), 0)`, [email, registrationNumber, purpose, otpHash(otp, email, purpose)]);
+  try { await sendStudentOtp(email, otp, purpose); }
+  catch (err) {
+    await pool.execute(`UPDATE student_auth_otps SET used_at = NOW() WHERE email = ? AND purpose = ? AND used_at IS NULL`, [email, purpose]);
+    if (err.message === "SMTP_NOT_CONFIGURED") throw err;
+    console.error("Student verification email failed:", err.message);
+    throw new Error("SMTP_SEND_FAILED");
+  }
+  return true;
+}
+async function verifyOtp(email, purpose, otp) {
+  const record = await first(`SELECT otp_id, otp_hash, attempts, registration_number FROM student_auth_otps WHERE email = ? AND purpose = ? AND used_at IS NULL AND expires_at > NOW() ORDER BY otp_id DESC LIMIT 1`, [email, purpose]);
+  if (!record || Number(record.attempts) >= 5) return null;
+  await pool.execute("UPDATE student_auth_otps SET attempts = attempts + 1 WHERE otp_id = ?", [record.otp_id]);
+  if (!safeEqual(record.otp_hash, otpHash(otp, email, purpose))) return null;
+  await pool.execute("UPDATE student_auth_otps SET used_at = NOW() WHERE otp_id = ?", [record.otp_id]);
+  return record;
+}
+const genericOtpMessage = "If the details match an eligible student record, a verification code will be sent to the university-recorded email address.";
+app.post("/api/auth/student-register/request-otp", asyncHandler(async (req, res) => {
+  const registrationNumber = requiredText(req.body?.registration_number, 60);
+  const email = requiredText(req.body?.email, 254)?.toLowerCase();
+  if (!registrationNumber || !email || !isEmail(email)) return sendError(res, 400, "Enter a valid registration number and university email.");
+  const student = await first(`SELECT student_id, email FROM students WHERE registration_number = ? AND LOWER(email) = ? LIMIT 1`, [registrationNumber, email]);
+  if (student) {
+    const existing = await first("SELECT user_id FROM app_users WHERE email = ? OR student_id = ? LIMIT 1", [email, student.student_id]);
+    if (!existing) {
+      try { await createOtp(email, "student-registration", registrationNumber); }
+      catch (err) { if (["SMTP_NOT_CONFIGURED", "SMTP_SEND_FAILED"].includes(err.message)) return sendError(res, 503, "Email verification is temporarily unavailable. Check the server SMTP settings and try again."); throw err; }
+    }
+  }
+  res.json({ success: true, message: genericOtpMessage });
+}));
+app.post("/api/auth/student-register/verify-otp", asyncHandler(async (req, res) => {
+  const registrationNumber = requiredText(req.body?.registration_number, 60);
+  const email = requiredText(req.body?.email, 254)?.toLowerCase();
+  const otp = typeof req.body?.otp === "string" ? req.body.otp.trim() : "";
+  if (!registrationNumber || !email || !isEmail(email) || !/^\d{6}$/.test(otp)) return sendError(res, 400, "Enter the registration number, university email and 6-digit code.");
+  const student = await first(`SELECT student_id FROM students WHERE registration_number = ? AND LOWER(email) = ? LIMIT 1`, [registrationNumber, email]);
+  if (!student) return sendError(res, 400, "The code could not be verified. Request a new code and check your details.");
+  const existing = await first("SELECT user_id FROM app_users WHERE email = ? OR student_id = ? LIMIT 1", [email, student.student_id]);
+  if (existing) return sendError(res, 409, "An account already exists. Please sign in instead.");
+  const verified = await verifyOtp(email, "student-registration", otp);
+  if (!verified || verified.registration_number !== registrationNumber) return sendError(res, 400, "Invalid or expired verification code. Request a new code.");
+  const verificationToken = jwt.sign({ purpose: "student-registration", student_id: student.student_id, email, registration_number: registrationNumber }, JWT_SECRET, { expiresIn: "15m" });
+  res.json({ success: true, verification_token: verificationToken, message: "Email verified. You can now create your password." });
+}));
 app.post("/api/auth/student-register", asyncHandler(async (req, res) => {
   const registrationNumber = requiredText(req.body?.registration_number, 60);
   const email = requiredText(req.body?.email, 254)?.toLowerCase();
   const password = typeof req.body?.password === "string" ? req.body.password : "";
-  if (!registrationNumber || !email || !isEmail(email) || password.length < 8) {
-    return sendError(res, 400, "Enter your university registration number, valid email, and a password of at least 8 characters.");
-  }
-  const student = await first(
-    `SELECT student_id, institution_id, first_name, last_name, email
-     FROM students WHERE registration_number = ? AND LOWER(email) = ? LIMIT 1`,
-    [registrationNumber, email]
-  );
-  if (!student) return sendError(res, 404, "No matching student record found. Check your registration number and university-recorded email, or contact the administrator.");
+  const verificationToken = typeof req.body?.verification_token === "string" ? req.body.verification_token : "";
+  if (!registrationNumber || !email || !isEmail(email) || password.length < 8 || password.length > 128 || !verificationToken) return sendError(res, 400, "Verify your university email first and enter a password of at least 8 characters.");
+  let verified;
+  try { verified = jwt.verify(verificationToken, JWT_SECRET); } catch { return sendError(res, 401, "Email verification expired. Please verify your email again."); }
+  if (verified.purpose !== "student-registration" || verified.email !== email || verified.registration_number !== registrationNumber) return sendError(res, 401, "Email verification does not match these student details.");
+  const student = await first(`SELECT student_id, institution_id, first_name, last_name, email FROM students WHERE student_id = ? AND registration_number = ? AND LOWER(email) = ? LIMIT 1`, [verified.student_id, registrationNumber, email]);
+  if (!student) return sendError(res, 400, "Student record no longer matches. Please start registration again.");
   const existing = await first("SELECT user_id FROM app_users WHERE email = ? OR student_id = ? LIMIT 1", [email, student.student_id]);
-  if (existing) return sendError(res, 409, "An account already exists for this email or student record. Please sign in or contact the administrator.");
+  if (existing) return sendError(res, 409, "An account already exists. Please sign in instead.");
   const name = `${student.first_name} ${student.last_name}`.trim();
   const hash = await bcrypt.hash(password, 12);
-  await pool.execute(
-    "INSERT INTO app_users (name, email, password_hash, role, student_id, institution_id) VALUES (?, ?, ?, 'student', ?, ?)",
-    [name, email, hash, student.student_id, student.institution_id]
-  );
+  await pool.execute("INSERT INTO app_users (name, email, password_hash, role, student_id, institution_id) VALUES (?, ?, ?, 'student', ?, ?)", [name, email, hash, student.student_id, student.institution_id]);
   res.status(201).json({ success: true, message: "Student account created. You can now sign in." });
+}));
+app.post("/api/auth/recover-registration/request-otp", asyncHandler(async (req, res) => {
+  const email = requiredText(req.body?.email, 254)?.toLowerCase();
+  if (!email || !isEmail(email)) return sendError(res, 400, "Enter a valid email address.");
+  const matches = await rows("SELECT student_id FROM students WHERE LOWER(email) = ? LIMIT 2", [email]);
+  if (matches.length === 1) {
+    try { await createOtp(email, "registration-recovery"); }
+    catch (err) { if (["SMTP_NOT_CONFIGURED", "SMTP_SEND_FAILED"].includes(err.message)) return sendError(res, 503, "Email verification is temporarily unavailable. Check the server SMTP settings and try again."); throw err; }
+  }
+  res.json({ success: true, message: genericOtpMessage });
+}));
+app.post("/api/auth/recover-registration/verify-otp", asyncHandler(async (req, res) => {
+  const email = requiredText(req.body?.email, 254)?.toLowerCase();
+  const otp = typeof req.body?.otp === "string" ? req.body.otp.trim() : "";
+  if (!email || !isEmail(email) || !/^\d{6}$/.test(otp)) return sendError(res, 400, "Enter a valid email and 6-digit code.");
+  const verified = await verifyOtp(email, "registration-recovery", otp);
+  if (!verified) return sendError(res, 400, "Invalid or expired verification code. Request a new code.");
+  const students = await rows("SELECT registration_number, first_name, last_name FROM students WHERE LOWER(email) = ? LIMIT 2", [email]);
+  if (students.length !== 1) return sendError(res, 400, "We could not safely identify one student record for this email. Contact the university administrator.");
+  res.json({ success: true, data: { name: `${students[0].first_name} ${students[0].last_name}`.trim(), registration_number: students[0].registration_number }, message: "Email verified successfully." });
 }));
 
 app.post("/api/auth/login", asyncHandler(async (req, res) => {
@@ -290,7 +388,7 @@ app.post("/api/auth/login", asyncHandler(async (req, res) => {
 
 // Protect every API below this point. Health, DB test and login/setup remain public.
 app.use("/api", (req, res, next) => {
-  if (["/health", "/db-test", "/auth/setup-status", "/auth/setup", "/auth/login", "/auth/student-register"].includes(req.path)) return next();
+  if (["/health", "/db-test", "/auth/setup-status", "/auth/setup", "/auth/login", "/auth/student-register", "/auth/student-register/request-otp", "/auth/student-register/verify-otp", "/auth/recover-registration/request-otp", "/auth/recover-registration/verify-otp"].includes(req.path)) return next();
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
   if (!token) return sendError(res, 401, "Please log in to continue.");
@@ -1240,6 +1338,30 @@ app.post(
 );
 
 // ------------------------------------------------------
+// ACADEMIC PERFORMANCE: UPDATE EXISTING MARKS (ADMIN ONLY)
+// ------------------------------------------------------
+app.put("/api/academic-performance/:id", asyncHandler(async (req, res) => {
+  const id = positiveId(req.params.id);
+  if (!id) return sendError(res, 400, "Invalid academic record ID.");
+  const current = await first(`SELECT ap.performance_id, ap.student_id, ap.subject_id, ap.exam_type, ap.marks_obtained, ap.exam_date, sub.max_marks
+    FROM academic_performance ap JOIN subjects sub ON sub.subject_id = ap.subject_id WHERE ap.performance_id = ?`, [id]);
+  if (!current) return sendError(res, 404, "Academic record not found.");
+  const marks = req.body?.marks_obtained === undefined ? Number(current.marks_obtained) : numberInRange(req.body.marks_obtained, 0, Number(current.max_marks));
+  const examType = req.body?.exam_type === undefined ? current.exam_type : req.body.exam_type;
+  const examDate = req.body?.exam_date === undefined ? String(current.exam_date).slice(0, 10) : req.body.exam_date;
+  if (marks === null || marks > Number(current.max_marks)) return sendError(res, 400, `Marks must be between 0 and ${current.max_marks}.`);
+  if (!validEnum(examType, ["internal", "midterm", "endterm", "practical"])) return sendError(res, 400, "Invalid exam type.");
+  if (!validDate(examDate)) return sendError(res, 400, "Invalid exam date.");
+  try {
+    await pool.execute("UPDATE academic_performance SET marks_obtained = ?, exam_type = ?, exam_date = ? WHERE performance_id = ?", [marks, examType, examDate, id]);
+  } catch (error) {
+    if (error?.code === "ER_DUP_ENTRY") return sendError(res, 409, "A record already exists for this student, subject and exam type.");
+    throw error;
+  }
+  res.json({ success: true, message: "Academic record updated successfully." });
+}));
+
+// ------------------------------------------------------
 // ATTENDANCE: LIST
 // ------------------------------------------------------
 
@@ -1872,6 +1994,18 @@ async function startServer() {
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       must_change_password TINYINT(1) NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS student_auth_otps (
+      otp_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      email VARCHAR(254) NOT NULL,
+      registration_number VARCHAR(60) NULL,
+      purpose ENUM('student-registration','registration-recovery') NOT NULL,
+      otp_hash CHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+      used_at DATETIME NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_student_auth_otp_lookup (email, purpose, used_at, expires_at)
     ) ENGINE=InnoDB`);
     const userColumns = await pool.query("SHOW COLUMNS FROM app_users LIKE 'must_change_password'");
     if (!userColumns[0].length) await pool.query("ALTER TABLE app_users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0");
